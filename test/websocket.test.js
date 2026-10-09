@@ -92,7 +92,9 @@ describe('WebSocket', () => {
         assert.strictEqual(count, 2);
       });
 
-      it('accepts the `maxPayload` option', (done) => {
+      it('accepts the receiver limit options', (done) => {
+        const maxBufferedChunks = 1024;
+        const maxFragments = 512;
         const maxPayload = 20480;
         const wss = new WebSocket.Server(
           {
@@ -102,10 +104,17 @@ describe('WebSocket', () => {
           () => {
             const ws = new WebSocket(`ws://localhost:${wss.address().port}`, {
               perMessageDeflate: true,
+              maxBufferedChunks,
+              maxFragments,
               maxPayload
             });
 
             ws.on('open', () => {
+              assert.strictEqual(
+                ws._receiver._maxBufferedChunks,
+                maxBufferedChunks
+              );
+              assert.strictEqual(ws._receiver._maxFragments, maxFragments);
               assert.strictEqual(ws._receiver._maxPayload, maxPayload);
               assert.strictEqual(
                 ws._receiver._extensions['permessage-deflate']._maxPayload,
@@ -118,6 +127,51 @@ describe('WebSocket', () => {
 
         wss.on('connection', (ws) => {
           ws.close();
+        });
+      });
+
+      it('limits the number of message fragments by default', (done) => {
+        let clientCloseEventEmitted = false;
+        let serverClientCloseEventEmitted = false;
+
+        const wss = new WebSocket.Server({ port: 0 }, () => {
+          const ws = new WebSocket(`ws://localhost:${wss.address().port}`);
+
+          ws.on('open', () => {
+            assert.strictEqual(ws._receiver._maxBufferedChunks, 256 * 1024);
+            assert.strictEqual(ws._receiver._maxFragments, 16 * 1024);
+          });
+
+          ws.on('error', (err) => {
+            assert.ok(err instanceof RangeError);
+            assert.strictEqual(err.code, 'WS_ERR_TOO_MANY_BUFFERED_PARTS');
+            assert.strictEqual(err.message, 'Too many message fragments');
+
+            ws.on('close', (code, reason) => {
+              assert.strictEqual(code, 1006);
+              assert.strictEqual(reason, EMPTY_BUFFER);
+
+              clientCloseEventEmitted = true;
+              if (serverClientCloseEventEmitted) wss.close(done);
+            });
+          });
+        });
+
+        wss.on('connection', (ws) => {
+          ws.on('close', (code, reason) => {
+            assert.strictEqual(code, 1008);
+            assert.deepStrictEqual(reason, EMPTY_BUFFER);
+
+            serverClientCloseEventEmitted = true;
+            if (clientCloseEventEmitted) wss.close(done);
+          });
+
+          //
+          // Send one more empty non-final fragment than the default limit.
+          //
+          for (let i = 0; i <= 16 * 1024; i++) {
+            ws.send(EMPTY_BUFFER, { fin: false });
+          }
         });
       });
 
@@ -604,7 +658,20 @@ describe('WebSocket', () => {
             });
           });
 
-          for (const client of wss.clients) client.terminate();
+          for (const client of wss.clients) {
+            //
+            // `socket.resetAndDestroy()` is not available in Node.js <
+            // 16.17.0. When available, use it to deterministically reset the
+            // connection as relying on writes to a destroyed peer is racy.
+            //
+            if (typeof client._socket.resetAndDestroy === 'function') {
+              client._socket.resetAndDestroy();
+              return;
+            }
+
+            client.terminate();
+          }
+
           ws.send('foo');
           ws.send('bar');
         });
